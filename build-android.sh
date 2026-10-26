@@ -70,7 +70,7 @@ android {
         minSdk 29
         targetSdk 35
         versionCode $RUN_NO
-        versionName '0.1.$RUN_NO'
+        versionName '1.0.$RUN_NO'
     }
 
     signingConfigs {
@@ -111,8 +111,11 @@ cat > "$P/app/src/main/AndroidManifest.xml" <<'EOF'
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.VIBRATE" />
 
     <application
@@ -220,15 +223,19 @@ import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.provider.MediaStore;
 import android.util.Base64;
+import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
+import android.view.WindowManager;
 import android.webkit.JavascriptInterface;
 import android.webkit.PermissionRequest;
 import android.webkit.ValueCallback;
@@ -243,25 +250,39 @@ import android.widget.FrameLayout;
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 public class MainActivity extends Activity {
 
     // หน้าเว็บในแอปถูกเสิร์ฟจากโดเมนนี้ เพื่อให้เป็น https (กล้องและ IndexedDB ต้องใช้)
     private static final String HOST = "appassets.androidplatform.net";
     private static final String START_URL = "https://" + HOST + "/index.html";
-    private static final int REQ_CAMERA = 7;
+    private static final int REQ_PERM = 7;
     private static final int REQ_FILE = 8;
 
+    private FrameLayout root;
     private WebView web;
     private PermissionRequest pendingPermission;
+    private String[] pendingResources;
     private ValueCallback<Uri[]> fileCallback;
+    private volatile boolean volumeAsShutter = false;
+    private final Map<String, PendingSave> saves = new HashMap<>();
+
+    private static class PendingSave {
+        Uri uri;
+        OutputStream out;
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
-        FrameLayout root = new FrameLayout(this);
-        root.setBackgroundColor(getColor(R.color.paper));
+        root = new FrameLayout(this);
+        root.setBackgroundColor(Color.parseColor("#101211"));
         web = new WebView(this);
         root.addView(web, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
@@ -292,7 +313,7 @@ public class MainActivity extends Activity {
         s.setAllowContentAccess(false);
         s.setTextZoom(100);
         web.setOverScrollMode(View.OVER_SCROLL_NEVER);
-        web.setBackgroundColor(getColor(R.color.paper));
+        web.setBackgroundColor(Color.parseColor("#101211"));
         web.addJavascriptInterface(new Bridge(), "MuanAndroid");
 
         web.setWebViewClient(new WebViewClient() {
@@ -324,17 +345,27 @@ public class MainActivity extends Activity {
             @Override
             public void onPermissionRequest(final PermissionRequest request) {
                 runOnUiThread(() -> {
-                    boolean wantsVideo = false;
+                    List<String> need = new ArrayList<>();
+                    List<String> ok = new ArrayList<>();
                     for (String r : request.getResources()) {
-                        if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(r)) wantsVideo = true;
+                        if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(r)) {
+                            ok.add(r);
+                            if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                                need.add(Manifest.permission.CAMERA);
+                            }
+                        } else if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(r)) {
+                            ok.add(r);
+                            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                                need.add(Manifest.permission.RECORD_AUDIO);
+                            }
+                        }
                     }
-                    if (!wantsVideo) { request.deny(); return; }
-                    if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-                        request.grant(new String[]{ PermissionRequest.RESOURCE_VIDEO_CAPTURE });
-                    } else {
-                        pendingPermission = request;
-                        requestPermissions(new String[]{ Manifest.permission.CAMERA }, REQ_CAMERA);
-                    }
+                    if (ok.isEmpty()) { request.deny(); return; }
+                    String[] resources = ok.toArray(new String[0]);
+                    if (need.isEmpty()) { request.grant(resources); return; }
+                    pendingPermission = request;
+                    pendingResources = resources;
+                    requestPermissions(need.toArray(new String[0]), REQ_PERM);
                 });
             }
 
@@ -358,13 +389,18 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
         super.onRequestPermissionsResult(code, perms, results);
-        if (code == REQ_CAMERA && pendingPermission != null) {
-            if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) {
-                pendingPermission.grant(new String[]{ PermissionRequest.RESOURCE_VIDEO_CAPTURE });
-            } else {
-                pendingPermission.deny();
+        if (code == REQ_PERM && pendingPermission != null) {
+            boolean cam = checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
+            boolean mic = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+            List<String> granted = new ArrayList<>();
+            for (String r : pendingResources) {
+                if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(r) && cam) granted.add(r);
+                if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(r) && mic) granted.add(r);
             }
+            if (granted.isEmpty()) pendingPermission.deny();
+            else pendingPermission.grant(granted.toArray(new String[0]));
             pendingPermission = null;
+            pendingResources = null;
         }
     }
 
@@ -375,6 +411,19 @@ public class MainActivity extends Activity {
             fileCallback.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(result, data));
             fileCallback = null;
         }
+    }
+
+    @Override
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        // ปุ่มเพิ่ม–ลดเสียงเป็นชัตเตอร์ เฉพาะตอนอยู่หน้ากล้องและเปิดตัวเลือกไว้
+        if (volumeAsShutter
+                && (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN)) {
+            if (event.getRepeatCount() == 0) {
+                web.evaluateJavascript("window.__muanShutter && window.__muanShutter()", null);
+            }
+            return true;
+        }
+        return super.onKeyDown(keyCode, event);
     }
 
     @Override
@@ -407,12 +456,17 @@ public class MainActivity extends Activity {
         return "application/octet-stream";
     }
 
-    // หน้าเว็บเรียกใช้เพื่อบันทึกรูปลงอัลบั้ม หรือบันทึก .zip ลงโฟลเดอร์ Download
+    private static boolean isLight(int c) {
+        double l = (0.299 * Color.red(c) + 0.587 * Color.green(c) + 0.114 * Color.blue(c)) / 255.0;
+        return l > 0.6;
+    }
+
+    // หน้าเว็บเรียกใช้เพื่อบันทึกรูป/วิดีโอลงอัลบั้ม แชร์ไฟล์ และตั้งสีแถบระบบ
     private class Bridge {
+
         @JavascriptInterface
-        public String saveFile(String name, String mime, String base64) {
+        public String beginSave(String name, String mime) {
             try {
-                byte[] bytes = Base64.decode(base64, Base64.DEFAULT);
                 ContentValues v = new ContentValues();
                 v.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
                 v.put(MediaStore.MediaColumns.MIME_TYPE, mime);
@@ -421,6 +475,9 @@ public class MainActivity extends Activity {
                 if (mime.startsWith("image/")) {
                     v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/Muan");
                     collection = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
+                } else if (mime.startsWith("video/")) {
+                    v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/Muan");
+                    collection = MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
                 } else {
                     v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Muan");
                     collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
@@ -428,16 +485,84 @@ public class MainActivity extends Activity {
                 ContentResolver cr = getContentResolver();
                 Uri item = cr.insert(collection, v);
                 if (item == null) return "error";
-                try (OutputStream out = cr.openOutputStream(item)) {
-                    out.write(bytes);
-                }
-                ContentValues done = new ContentValues();
-                done.put(MediaStore.MediaColumns.IS_PENDING, 0);
-                cr.update(item, done, null, null);
-                return "saved";
+                OutputStream out = cr.openOutputStream(item);
+                if (out == null) return "error";
+                PendingSave p = new PendingSave();
+                p.uri = item;
+                p.out = out;
+                String token = String.valueOf(System.nanoTime());
+                synchronized (saves) { saves.put(token, p); }
+                return token;
             } catch (Exception e) {
                 return "error";
             }
+        }
+
+        @JavascriptInterface
+        public String writeChunk(String token, String base64) {
+            PendingSave p;
+            synchronized (saves) { p = saves.get(token); }
+            if (p == null) return "error";
+            try {
+                p.out.write(Base64.decode(base64, Base64.DEFAULT));
+                return "ok";
+            } catch (Exception e) {
+                return "error";
+            }
+        }
+
+        @JavascriptInterface
+        public String endSave(String token) {
+            PendingSave p;
+            synchronized (saves) { p = saves.remove(token); }
+            if (p == null) return "error";
+            try {
+                p.out.flush();
+                p.out.close();
+                ContentValues done = new ContentValues();
+                done.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                getContentResolver().update(p.uri, done, null, null);
+                return "saved|" + p.uri.toString();
+            } catch (Exception e) {
+                return "error";
+            }
+        }
+
+        @JavascriptInterface
+        public void shareUri(final String uri, final String mime) {
+            runOnUiThread(() -> {
+                try {
+                    Intent i = new Intent(Intent.ACTION_SEND);
+                    i.setType(mime == null || mime.isEmpty() ? "*/*" : mime);
+                    i.putExtra(Intent.EXTRA_STREAM, Uri.parse(uri));
+                    i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    startActivity(Intent.createChooser(i, null));
+                } catch (Exception ignored) { }
+            });
+        }
+
+        @JavascriptInterface
+        public void setVolKeys(boolean on) {
+            volumeAsShutter = on;
+        }
+
+        @JavascriptInterface
+        public void setBars(final String top, final String bottom) {
+            runOnUiThread(() -> {
+                try {
+                    int t = Color.parseColor(top);
+                    int b = Color.parseColor(bottom);
+                    int[] colors = new int[]{ t, t, b, b };
+                    GradientDrawable gd = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, colors);
+                    gd.setColors(colors, new float[]{ 0f, 0.5f, 0.5f, 1f });
+                    root.setBackground(gd);
+                    View d = getWindow().getDecorView();
+                    int f = d.getSystemUiVisibility();
+                    f = isLight(t) ? (f | View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR) : (f & ~View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
+                    f = isLight(b) ? (f | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR) : (f & ~View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
+                    d.setSystemUiVisibility(f);
+                } catch (Exception ignored) { }
+            });
         }
     }
 }
@@ -449,4 +574,9 @@ EOF
 mkdir -p "$ROOT/dist"
 cp "$P/app/build/outputs/apk/release/app-release.apk" "$ROOT/dist/muan.apk"
 echo "เสร็จแล้ว: dist/muan.apk"
+
+# ไฟล์ .aab สำหรับอัปโหลดขึ้น Google Play (ถ้าสร้างไม่ได้ก็ข้าม ไม่กระทบ APK)
+if "$GRADLE" -p "$P" bundleRelease --no-daemon; then
+  cp "$P/app/build/outputs/bundle/release/app-release.aab" "$ROOT/dist/muan.aab" || true
+fi
 ls -la "$ROOT/dist"
