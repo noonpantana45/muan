@@ -1,0 +1,31 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build APK
+        run: bash build-android.sh
+
+      - name: Publish download link
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG="v0.1.${GITHUB_RUN_NUMBER}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/muan.apk --clobber
+          else
+            gh release create "$TAG" dist/muan.apk --title "ม้วน 0.1.${GITHUB_RUN_NUMBER}" --notes "รุ่นทดลอง" --latest
+          fi
+
